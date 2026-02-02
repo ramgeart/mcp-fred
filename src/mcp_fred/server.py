@@ -4,17 +4,31 @@ MCP Server for FRED (Federal Reserve Economic Data)
 Technical interface for macroeconomic data retrieval.
 """
 
-import argparse
 import asyncio
+import json
 import os
+import sys
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-import pandas as pd
-import requests
+# MCP imports only - keep startup fast
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
+
+# Global client storage (initialized lazily)
+_client = None
+_api_key = None
+
+
+def get_client():
+    """Lazy initialization of FRED client."""
+    global _client, _api_key
+    if _client is None:
+        _api_key = os.environ.get("FRED_API_KEY", "")
+        if _api_key:
+            _client = FredClient(_api_key)
+    return _client
 
 
 class FredClient:
@@ -28,13 +42,13 @@ class FredClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-    def get_series(self, series_id: str, params: Optional[Dict] = None) -> pd.DataFrame:
+    def get_series(self, series_id: str, params: Optional[Dict] = None) -> list:
         """
         Obtiene observaciones de una serie específica.
-
-        Identidad: Datos_Observados = f(Series_ID, API_Key)
-        Restricción: Requiere conexión HTTP 200 y JSON válido.
+        Lazy import of requests and pandas.
         """
+        import requests
+
         query_params = {
             "series_id": series_id,
             "api_key": self.api_key,
@@ -49,27 +63,26 @@ class FredClient:
             response.raise_for_status()
             data = response.json()
 
-            # Validación de estructura de datos
             if 'observations' not in data:
-                return pd.DataFrame()
+                return []
 
-            df = pd.DataFrame(data['observations'])
-            # Conversión de tipos para asegurar integridad matemática
-            df['date'] = pd.to_datetime(df['date'])
-            df['value'] = pd.to_numeric(df['value'], errors='coerce')
+            # Return raw observations without pandas
+            observations = []
+            for obs in data['observations']:
+                try:
+                    value = float(obs['value'])
+                    observations.append({
+                        'date': obs['date'],
+                        'value': value
+                    })
+                except (ValueError, TypeError):
+                    continue
 
-            # Eliminación de valores nulos para mantener consistencia en el cálculo
-            return df.dropna(subset=['value'])
+            return observations
 
-        except requests.exceptions.RequestException as e:
-            # Reporte explícito de falla en acceso a datos
-            print(f"Error de acceso a datos: {e}")
-            return pd.DataFrame()
+        except Exception as e:
+            return [{"error": str(e)}]
 
-
-# Initialize FRED client
-api_key = os.environ.get("FRED_API_KEY", "")
-client = FredClient(api_key) if api_key else None
 
 # MCP Server
 app = Server("mcp-fred")
@@ -133,7 +146,9 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     """Execute FRED tools."""
-    if not client or not client.api_key:
+    client = get_client()
+
+    if not client or not _api_key:
         return [TextContent(
             type="text",
             text="ERROR: FRED_API_KEY environment variable not set"
@@ -151,34 +166,46 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         if end_date:
             params["observation_end"] = end_date
 
-        df = client.get_series(series_id, params)
+        observations = client.get_series(series_id, params)
 
-        if df.empty:
+        if not observations:
             return [TextContent(
                 type="text",
                 text=f"No data retrieved for series '{series_id}'. "
                      "Verify series ID validity or connectivity."
             )]
 
-        # Get last N observations
-        df = df.tail(limit)
+        if len(observations) > 0 and "error" in observations[0]:
+            return [TextContent(
+                type="text",
+                text=f"Error: {observations[0]['error']}"
+            )]
 
-        # Format output
+        # Get last N observations
+        observations = observations[-limit:] if len(observations) > limit else observations
+
+        # Format output without pandas
         output = f"Series: {series_id}\n"
-        output += f"Observations: {len(df)}\n"
-        output += f"Period: {df['date'].min().strftime('%Y-%m-%d')} to "
-        output += f"{df['date'].max().strftime('%Y-%m-%d')}\n\n"
-        output += df.to_string(index=False)
+        output += f"Observations: {len(observations)}\n"
+        if observations:
+            dates = [obs['date'] for obs in observations]
+            output += f"Period: {min(dates)} to {max(dates)}\n\n"
+            output += "date       | value\n"
+            output += "-----------+-------\n"
+            for obs in observations:
+                output += f"{obs['date']} | {obs['value']}\n"
 
         return [TextContent(type="text", text=output)]
 
     elif name == "get_series_info":
+        import requests
+
         series_id = arguments.get("series_id")
 
         url = "https://api.stlouisfed.org/fred/series"
         params = {
             "series_id": series_id,
-            "api_key": client.api_key,
+            "api_key": _api_key,
             "file_type": "json"
         }
 
@@ -200,11 +227,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             output += f"Units: {series.get('units', 'N/A')}\n"
             output += f"Seasonal Adjustment: {series.get('seasonal_adjustment', 'N/A')}\n"
             output += f"Last Updated: {series.get('last_updated', 'N/A')}\n"
-            output += f"Notes: {series.get('notes', 'N/A')[:200]}..."
+            notes = series.get('notes', 'N/A')
+            output += f"Notes: {notes[:200]}{'...' if len(notes) > 200 else ''}"
 
             return [TextContent(type="text", text=output)]
 
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             return [TextContent(
                 type="text",
                 text=f"Error retrieving series info: {e}"
@@ -215,7 +243,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
 async def main():
     """Run MCP server."""
+    # Use stderr for logging to avoid interfering with stdio protocol
+    print("Starting MCP FRED server...", file=sys.stderr)
     async with stdio_server() as (read_stream, write_stream):
+        print("Server initialized, running...", file=sys.stderr)
         await app.run(
             read_stream,
             write_stream,
